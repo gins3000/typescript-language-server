@@ -7,7 +7,7 @@
 
 import * as chai from 'chai';
 import * as lsp from 'vscode-languageserver';
-import * as lspcalls from './lsp-protocol.calls.proposed';
+import * as lspCallHierarchy from './lsp-protocol.callHierarchy.proposed';
 import { LspServer } from './lsp-server';
 import { uri, createServer, position, lastPosition } from './test-utils';
 import { TextDocument } from 'vscode-languageserver';
@@ -428,133 +428,181 @@ describe('documentHighlight', () => {
     }).timeout(10000);
 });
 
-describe('calls', () => {
-    function resultToString(callsResult: lspcalls.CallsResult, direction: lspcalls.CallDirection) {
-        if (!callsResult.symbol) {
-            if (callsResult.calls.length > 0) {
-                return '<unexpected calls>';
-            }
-            return '<symbol not found>';
+describe.only('callHierarchy', () => {
+    function resultToString(item: lspCallHierarchy.CallHierarchyItem | null) {
+        if (!item) {
+            return '<not found>';
         }
-        const arrow = lspcalls.CallDirection.Outgoing === direction ? '↖' : '↘';
-        const symbolToString = (symbol: lspcalls.DefinitionSymbol) =>
-            `${symbol.name} (${symbol.location.uri.split('/').pop()}#${symbol.selectionRange.start.line})`;
+        const arrow = '-|>';
+        const symbolToString = (item: lspCallHierarchy.CallHierarchyItem) =>
+            `${item.name} (symbol: ${item.uri.split('/').pop()}#${item.selectionRange.start.line})`;
+        const callToString = (call: lspCallHierarchy.CallHierarchyItem) =>
+            `  ${arrow} ${symbolToString(call)} - (call: ${call.callLocation!.uri.split('/').pop()}#${call.callLocation!.range.start.line})`;
         const out: string[] = [];
-        out.push(`${arrow} ${symbolToString(callsResult.symbol)}`);
-        for (const call of callsResult.calls) {
-            out.push(`  ${arrow} ${symbolToString(call.symbol)} - ${call.location.uri.split('/').pop()}#${call.location.range.start.line}`);
+        out.push(`${arrow} ${symbolToString(item)}`);
+        if (item.callers) {
+            out.push(`callers:`);
+            for (const call of item.callers) {
+                out.push(callToString(call));
+            }
         }
-        return out.join('\n');
+        if (item.callees) {
+            out.push(`callees:`);
+            for (const call of item.callees) {
+                out.push(callToString(call));
+            }
+        }
+        return out.join('\n').trim();
     }
-    const doDoc = {
-        uri: uri('do.ts'),
+    const oneDoc = {
+        uri: uri('one.ts'),
         languageId: 'typescript',
         version: 1,
-        text: `
-export function doStuff(): boolean {
-    return two() !== undefined;
-}
-export function two() {
-    three();
-    const ttt = three;
-    return ttt();
-}
-export function three() {
-    return "".toString();
-}
-`
+        text: `// comment line
+import { Two } from './two'
+export function main() {
+    new Two().callThreeTwice();
+}`
     };
 
-    const fooDoc = {
-        uri: uri('foo.ts'),
+    const twoDoc = {
+        uri: uri('two.ts'),
         languageId: 'typescript',
         version: 1,
-        text: `import { doStuff } from './do';
-class MyClass {
-    doSomething() {
-        doStuff();
-        const x = doStuff();
-        function f() {};
+        text: `// comment line
+import { Three } from "./three";
+export class Two {
+    callThreeTwice() {
+        new Three().tada();
+        new Three().tada();
     }
 }
-export function factory() {
-    new MyClass().doSomething();
+`};
+    const threeDoc = {
+        uri: uri('three.ts'),
+        languageId: 'typescript',
+        version: 1,
+        text: `// comment line
+export class Three {
+    tada() {
+        print('🎉');
+    }
+}
+export function print(s: string) {
+    console.log(s);
 }
 `
     };
 
     function openDocuments() {
-        server.didOpenTextDocument({
-            textDocument: doDoc
-        });
-        server.didOpenTextDocument({
-            textDocument: fooDoc
-        });
+        for (const textDocument of [oneDoc, twoDoc, threeDoc]) {
+            server.didOpenTextDocument({ textDocument });
+        }
     }
 
-    it('callers: first step', async () => {
+    it('find target symbol', async () => {
         openDocuments();
-        const callsResult = await server.calls({
-            textDocument: fooDoc,
-            position: lsp.Position.create(3, 9)
+        const item = await server.callHierarchy(<lspCallHierarchy.CallHierarchyParams>{
+            textDocument: twoDoc,
+            position: lsp.Position.create(4, 22),
+            direction: 'incoming',
+            resolve: 0
         });
-        assert.equal(
-            resultToString(callsResult, lspcalls.CallDirection.Incoming),
+        assert.equal(resultToString(item),
             `
-↘ doStuff (do.ts#1)
-  ↘ doSomething (foo.ts#2) - foo.ts#3
-  ↘ x (foo.ts#4) - foo.ts#4
+-|> tada (symbol: three.ts#2)
             `.trim()
         );
     }).timeout(10000);
 
-    it('callers: second step', async () => {
+    it('callers: first level', async () => {
         openDocuments();
-        const callsResult = await server.calls({
-            textDocument: fooDoc,
-            position: lsp.Position.create(2, 5)
+        const item = await server.callHierarchy(<lspCallHierarchy.CallHierarchyParams>{
+            textDocument: twoDoc,
+            position: lsp.Position.create(4, 22),
+            direction: 'incoming',
+            resolve: 1
+        });
+        assert.equal(resultToString(item),
+            `
+-|> tada (symbol: three.ts#2)
+callers:
+  -|> callThreeTwice (symbol: two.ts#3) - (call: two.ts#4)
+  -|> callThreeTwice (symbol: two.ts#3) - (call: two.ts#5)
+            `.trim()
+        );
+    }).timeout(10000);
+
+    it('callers: second level', async () => {
+        openDocuments();
+        const firstItem = await server.callHierarchy(<lspCallHierarchy.CallHierarchyParams>{
+            textDocument: twoDoc,
+            position: lsp.Position.create(4, 22),
+            direction: 'incoming',
+            resolve: 1
+        });
+        assert.isTrue(firstItem !== null, "precondition failed: first level");
+        assert.isTrue(firstItem!.callers !== undefined, "precondition failed: unresolved callers of first level");
+        assert.isTrue(firstItem!.callers![0] !== undefined, "precondition failed: unresolved callers of first level");
+
+        const unresolvedItem = firstItem!.callers![0];
+        const callsResult = await server.callHierarchy(<lspCallHierarchy.ResolveCallHierarchyItemParams>{
+            item: unresolvedItem,
+            direction: 'incoming',
+            resolve: 1
         });
         assert.equal(
-            resultToString(callsResult, lspcalls.CallDirection.Incoming),
+            resultToString(callsResult),
             `
-↘ doSomething (foo.ts#2)
-  ↘ factory (foo.ts#8) - foo.ts#9
+-|> callThreeTwice (symbol: two.ts#3)
+callers:
+  -|> main (symbol: one.ts#2) - (call: one.ts#3)
             `.trim()
         );
     }).timeout(10000);
 
     it('callees: first step', async () => {
         openDocuments();
-        const direction = lspcalls.CallDirection.Outgoing;
-        const callsResult = await server.calls({
-            direction,
-            textDocument: fooDoc,
-            position: lsp.Position.create(3, 9)
+        const item = await server.callHierarchy({
+            textDocument: oneDoc,
+            position: lsp.Position.create(3, 18), // `callThreeTwice()`
+            direction: 'outgoing',
+            resolve: 1
         });
-        assert.equal(
-            resultToString(callsResult, direction),
+        assert.equal(resultToString(item),
             `
-↖ doStuff (do.ts#1)
-  ↖ two (do.ts#4) - do.ts#2
-            `.trim()
+-|> callThreeTwice (symbol: two.ts#3)
+callees:
+  -|> Three (symbol: two.ts#1) - (call: two.ts#4)
+  -|> tada (symbol: three.ts#2) - (call: two.ts#4)
+  -|> Three (symbol: two.ts#1) - (call: two.ts#5)
+  -|> tada (symbol: three.ts#2) - (call: two.ts#5)`.trim()
         );
     }).timeout(10000);
 
     it('callees: second step', async () => {
         openDocuments();
-        const direction = lspcalls.CallDirection.Outgoing;
-        const callsResult = await server.calls({
-            direction,
-            textDocument: doDoc,
-            position: lsp.Position.create(4, 17)
+        const firstItem = await server.callHierarchy({
+            textDocument: oneDoc,
+            position: lsp.Position.create(3, 18), // `callThreeTwice()`
+            direction: 'outgoing',
+            resolve: 1
         });
-        assert.equal(
-            resultToString(callsResult, direction),
+        assert.isTrue(firstItem !== null, "precondition failed: first level");
+        assert.isTrue(firstItem!.callees !== undefined, "precondition failed: unresolved callers of first level");
+        assert.isTrue(firstItem!.callees![1] !== undefined, "precondition failed: unresolved callers of first level");
+
+        const unresolvedItem = firstItem!.callees![1];
+        const item = await server.callHierarchy({
+            item: unresolvedItem,
+            direction: 'outgoing',
+            resolve: 1
+        });
+        assert.equal(resultToString(item),
             `
-↖ two (do.ts#4)
-  ↖ three (do.ts#9) - do.ts#5
-  ↖ ttt (do.ts#6) - do.ts#7
-            `.trim()
+-|> tada (symbol: three.ts#2)
+callees:
+  -|> print (symbol: three.ts#6) - (call: three.ts#3)`.trim()
         );
     }).timeout(10000);
 });

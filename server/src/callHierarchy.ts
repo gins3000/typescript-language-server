@@ -1,70 +1,104 @@
 
 import * as tsp from 'typescript/lib/protocol';
 import * as lsp from 'vscode-languageserver';
-import * as lspcalls from './lsp-protocol.calls.proposed';
+import * as lspCallHierarchy from './lsp-protocol.callHierarchy.proposed';
 import { TspClient } from './tsp-client';
 import { CommandTypes } from './tsp-command-types';
-import { uriToPath, toLocation, asRange, Range, toSymbolKind, pathToUri } from './protocol-translation';
+import { uriToPath, toLocation, asRange, Range, toSymbolKind, pathToUri, asTextSpan } from './protocol-translation';
 
-export async function computeCallers(tspClient: TspClient, args: lsp.TextDocumentPositionParams): Promise<lspcalls.CallsResult> {
-    const nullResult = { calls: [] };
-    const contextDefinition = await getDefinition(tspClient, args);
-    if (!contextDefinition) {
-        return nullResult;
+export type DocumentProvider = (file: string) => lsp.TextDocument | undefined;
+
+// tslint:disable-next-line:max-line-length
+export async function computeCallHierarchy(tspClient: TspClient, documentProvider: DocumentProvider, params: lspCallHierarchy.CallHierarchyParams | lspCallHierarchy.ResolveCallHierarchyItemParams): Promise<lspCallHierarchy.CallHierarchyItem | null> {
+    const item = ('item' in params) ? params.item : await getItem(tspClient, params);
+    if (!item) {
+        return null;
     }
-    const contextSymbol = await findEnclosingSymbol(tspClient, contextDefinition);
-    if (!contextSymbol) {
-        return nullResult;
+    const direction = params.direction || 'incoming';
+    const levelsToResolve = params.resolve || 0;
+    if (direction === 'incoming') {
+        // TODO consider levels
+        if (levelsToResolve > 0) {
+            const callers = await resolveCallers(tspClient, item);
+            item.callers = callers;
+        }
+        return item;
+    } else {
+        // TODO consider levels
+        if (levelsToResolve > 0) {
+            const callees = await resolveCallees(tspClient, documentProvider, item);
+            item.callees = callees;
+        }
+        return item;
     }
-    const callerReferences = await findNonDefinitionReferences(tspClient, contextDefinition);
-    const calls: lspcalls.Call[] = [];
+}
+
+async function getItem(tspClient: TspClient, params: lspCallHierarchy.CallHierarchyParams): Promise<lspCallHierarchy.CallHierarchyItem | null> {
+    const contextDefinition = await getDefinition(tspClient, params);
+    const uri = contextDefinition && pathToUri(contextDefinition.file, undefined);
+    const contextSymbol = contextDefinition && await findEnclosingSymbol(tspClient, contextDefinition);
+    if (!contextSymbol || !uri) {
+        return null;
+    }
+    const { name, detail, kind, range, selectionRange } = contextSymbol;
+    return { uri, name, detail, kind, range, selectionRange };
+}
+
+async function resolveCallers(tspClient: TspClient, item: lspCallHierarchy.CallHierarchyItem): Promise<lspCallHierarchy.CallHierarchyItem[]> {
+
+    const file = uriToPath(item.uri);
+    if (!file) {
+        return [];
+    }
+    const range = asTextSpan(item.selectionRange);
+    const callerReferences = await findNonDefinitionReferences(tspClient, { file,  ...range });
+
+    const callers: lspCallHierarchy.CallHierarchyItem[] = [];
     for (const callerReference of callerReferences) {
         const symbol = await findEnclosingSymbol(tspClient, callerReference);
         if (!symbol) {
             continue;
         }
-        const location = toLocation(callerReference, undefined);
-        calls.push({
-            location,
-            symbol
-        });
+        const { name, detail, kind, range, selectionRange } = symbol;
+        const uri = pathToUri(callerReference.file, undefined);
+        const callLocation = toLocation(callerReference, undefined);
+        callers.push({ uri, name, detail, kind, range, selectionRange, callLocation });
     }
-    return { calls, symbol: contextSymbol };
+    return callers;
 }
-export type DocumentProvider = (file: string) => lsp.TextDocument | undefined;
-export async function computeCallees(tspClient: TspClient, args: lsp.TextDocumentPositionParams, documentProvider: DocumentProvider): Promise<lspcalls.CallsResult> {
-    const nullResult = { calls: [] };
-    const contextDefinition = await getDefinition(tspClient, args);
-    if (!contextDefinition) {
-        return nullResult;
+
+async function resolveCallees(tspClient: TspClient, documentProvider: DocumentProvider, item: lspCallHierarchy.CallHierarchyItem): Promise<lspCallHierarchy.CallHierarchyItem[]> {
+
+    const file = uriToPath(item.uri);
+    if (!file) {
+        return [];
     }
-    const contextSymbol = await findEnclosingSymbol(tspClient, contextDefinition);
-    if (!contextSymbol) {
-        return nullResult;
-    }
-    const outgoingCallReferences = await findOutgoingCalls(tspClient, contextSymbol, documentProvider);
-    const calls: lspcalls.Call[] = [];
+    const range = asTextSpan(item.selectionRange);
+
+    const outgoingCallReferences = await findOutgoingCalls(tspClient, item, documentProvider);
+    const callees: lspCallHierarchy.CallHierarchyItem[] = [];
     for (const reference of outgoingCallReferences) {
+        let definitionSymbol: lsp.DocumentSymbol | undefined;
+        let uri: string | undefined;
         const definitionReferences = await findDefinitionReferences(tspClient, reference);
-        const definitionReference = definitionReferences[0];
-        if (!definitionReference) {
+        for (const definitionReference of definitionReferences) {
+            definitionSymbol = await findEnclosingSymbol(tspClient, definitionReference);
+            if (definitionSymbol) {
+                uri = pathToUri(definitionReference.file, undefined);
+                break;
+            }
+        }
+        if (!definitionSymbol || !uri) {
             continue;
         }
-        const definitionSymbol = await findEnclosingSymbol(tspClient, definitionReference);
-        if (!definitionSymbol) {
-            continue;
-        }
-        const location = toLocation(reference, undefined);
-        calls.push({
-            location,
-            symbol: definitionSymbol
-        });
+        const callLocation = toLocation(reference, undefined);
+        const { name, detail, kind, range, selectionRange } = definitionSymbol;
+        callees.push({ uri, name, detail, kind, range, selectionRange, callLocation });
     }
-    return { calls, symbol: contextSymbol };
+    return callees;
 }
 
-async function findOutgoingCalls(tspClient: TspClient, contextSymbol: lspcalls.DefinitionSymbol, documentProvider: DocumentProvider): Promise<tsp.FileSpan[]> {
-
+async function findOutgoingCalls(tspClient: TspClient, callHierarchyItem: lspCallHierarchy.CallHierarchyItem, documentProvider: DocumentProvider): Promise<tsp.FileSpan[]> {
     /**
      * The TSP does not provide call references.
      * As long as we are not able to access the AST in a tsserver plugin and return the information necessary as metadata to the reponse,
@@ -104,12 +138,12 @@ async function findOutgoingCalls(tspClient: TspClient, contextSymbol: lspcalls.D
     }
 
     const calls: tsp.FileSpan[] = [];
-    const file = uriToPath(contextSymbol.location.uri)!;
+    const file = uriToPath(callHierarchyItem.uri)!;
     const document = documentProvider(file);
     if (!document) {
         return calls;
     }
-    const candidateRanges = computeCallCandidates(document, contextSymbol.location.range);
+    const candidateRanges = computeCallCandidates(document, callHierarchyItem.range);
     for (const candidateRange of candidateRanges) {
         const call = await validateCall(file, candidateRange);
         if (call) {
@@ -132,7 +166,7 @@ async function getDefinition(tspClient: TspClient, args: lsp.TextDocumentPositio
     return definitionResult.body ? definitionResult.body[0] : undefined;
 }
 
-async function findEnclosingSymbol(tspClient: TspClient, args: tsp.FileSpan): Promise<lspcalls.DefinitionSymbol | undefined> {
+async function findEnclosingSymbol(tspClient: TspClient, args: tsp.FileSpan): Promise<lsp.DocumentSymbol | undefined> {
     const file = args.file;
     const response = await tspClient.request(CommandTypes.NavTree, { file });
     const tree = response.body;
@@ -141,11 +175,7 @@ async function findEnclosingSymbol(tspClient: TspClient, args: tsp.FileSpan): Pr
     }
     const pos = lsp.Position.create(args.start.line - 1, args.start.offset - 1);
     const symbol = await findEnclosingSymbolInTree(tree, lsp.Range.create(pos, pos));
-    if (!symbol) {
-        return undefined;
-    }
-    const uri = pathToUri(file, undefined);
-    return lspcalls.DefinitionSymbol.create(uri, symbol);
+    return symbol;
 }
 
 async function findEnclosingSymbolInTree(parent: tsp.NavigationTree, range: lsp.Range): Promise<lsp.DocumentSymbol | undefined> {
